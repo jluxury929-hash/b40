@@ -1,6 +1,6 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v206.0 (JS-UNIFIED - ABSOLUTE FINALITY + MULTICALL SCANNER)
+ * APEX PREDATOR v206.1 (JS-UNIFIED - ABSOLUTE FINALITY + RATE-LIMIT HARDENING)
  * ===============================================================================
  */
 
@@ -19,8 +19,6 @@ try {
 }
 
 const { ethers } = global.ethers;
-const axios = global.axios;
-const Sentiment = global.Sentiment;
 
 // ==========================================
 // 1. INFRASTRUCTURE & MULTICALL CONFIG
@@ -41,10 +39,15 @@ class ApexOmniGovernor {
     constructor() {
         this.wallets = {};
         this.providers = {};
+        this.lastCallTime = 0;
         
         for (const [name, config] of Object.entries(NETWORKS)) {
             try {
-                const provider = new ethers.JsonRpcProvider(config.rpc, config.chainId, { staticNetwork: true });
+                // ethers v6 fix for heavy RPC loads
+                const provider = new ethers.JsonRpcProvider(config.rpc, config.chainId, { 
+                    staticNetwork: true,
+                    batchMaxCount: 1 // Reduces complexity of requests to Infura
+                });
                 this.providers[name] = provider;
                 if (PRIVATE_KEY) this.wallets[name] = new ethers.Wallet(PRIVATE_KEY, provider);
             } catch (e) { console.log(`[${name}] Offline.`.red); }
@@ -52,49 +55,52 @@ class ApexOmniGovernor {
     }
 
     /**
-     * PRO-LEVEL: Multicall Aggregate
-     * Fetches 50+ reserves in 1 RPC call to minimize latency.
+     * RATE LIMIT SHIELD: Throttles requests to avoid 429 errors
      */
+    async throttle() {
+        const now = Date.now();
+        const diff = now - this.lastCallTime;
+        if (diff < 200) { // Ensure at least 200ms between major clusters
+            await new Promise(r => setTimeout(r, 200 - diff));
+        }
+        this.lastCallTime = Date.now();
+    }
+
     async getBulkReserves(networkName, poolAddresses) {
         const config = NETWORKS[networkName];
-        if (!config.multicall) return [];
-
         const poolAbi = ["function getReserves() external view returns (uint112, uint112, uint32)"];
         const multicallAbi = ["function aggregate(tuple(address target, bytes callData)[] calls) external view returns (uint256 blockNumber, bytes[] returnData)"];
         
         const itf = new ethers.Interface(poolAbi);
         const multi = new ethers.Contract(config.multicall, multicallAbi, this.providers[networkName]);
 
-        const calls = poolAddresses.map(addr => ({
-            target: addr,
-            callData: itf.encodeFunctionData("getReserves")
-        }));
-
         try {
-            const [, returnData] = await multi.aggregate(calls);
+            await this.throttle();
+            const [, returnData] = await multi.aggregate(poolAddresses.map(addr => ({
+                target: addr,
+                callData: itf.encodeFunctionData("getReserves")
+            })));
             return returnData.map(data => itf.decodeFunctionResult("getReserves", data));
         } catch (e) {
+            if (e.message.includes("429")) console.log(`[${networkName}] Rate Limited. Backing off...`.yellow);
             return [];
         }
     }
 
-    /**
-     * CYCLIC MATH: Calculates profit for A -> B -> C -> A
-     * Includes 0.3% fees per hop (997/1000 multiplier)
-     */
     calculateCyclicPath(amountIn, reserves) {
         let currentAmount = amountIn;
-        // Uniswap V2 constant: 0.3% fee = 997/1000
         const feeNumerator = 997n;
         const feeDenominator = 1000n;
 
-        for (const [resIn, resOut] of reserves) {
+        for (const res of reserves) {
+            if (!res || res.length < 2) continue;
+            const [resIn, resOut] = [BigInt(res[0]), BigInt(res[1])];
             const amountInWithFee = currentAmount * feeNumerator;
             const numerator = amountInWithFee * resOut;
             const denominator = (resIn * feeDenominator) + amountInWithFee;
             currentAmount = numerator / denominator;
         }
-        return currentAmount - amountIn; // Positive = Profit
+        return currentAmount - amountIn;
     }
 
     async executeStrike(networkName, targetPools = []) {
@@ -104,55 +110,46 @@ class ApexOmniGovernor {
         const wallet = this.wallets[networkName];
         const provider = this.providers[networkName];
 
-        // 1. Get Balances/Fees
-        const [balance, feeData] = await Promise.all([
-            provider.getBalance(wallet.address),
-            provider.getFeeData()
-        ]);
-        
-        const amountIn = balance - (ethers.parseEther(config.moat) + ethers.parseEther("0.005"));
-        if (amountIn <= 0n) return;
-
-        // 2. Multicall Scan
-        const reserves = await this.getBulkReserves(networkName, targetPools);
-        
-        // 3. Cyclic Calculation (Example: 3-pool triangle)
-        const netProfit = this.calculateCyclicPath(amountIn, reserves);
-
-        if (netProfit > 0n) {
-            console.log(`[${networkName}] ARB FOUND: +${ethers.formatEther(netProfit)} ETH`.gold);
+        try {
+            await this.throttle();
+            const [balance, feeData] = await Promise.all([
+                provider.getBalance(wallet.address),
+                provider.getFeeData()
+            ]);
             
-            const abi = ["function executeTriangle(address router, address[] path, uint256 amountIn) external payable"];
-            const contract = new ethers.Contract(EXECUTOR, abi, wallet);
+            const amountIn = balance - (ethers.parseEther(config.moat) + ethers.parseEther("0.005"));
+            if (amountIn <= 0n) return;
 
-            try {
-                const tx = await contract.executeTriangle(
-                    config.router,
-                    ["0x...", "0x...", "0x..."], // Your specific path
-                    amountIn,
-                    { value: amountIn, gasLimit: 1000000 }
-                );
+            const reserves = await this.getBulkReserves(networkName, targetPools);
+            if (reserves.length === 0) return;
+
+            const netProfit = this.calculateCyclicPath(amountIn, reserves);
+
+            if (netProfit > 0n) {
+                console.log(`[${networkName}] ARB FOUND: +${ethers.formatEther(netProfit)} ETH`.gold);
+                const abi = ["function executeTriangle(address router, address[] path, uint256 amountIn) external payable"];
+                const contract = new ethers.Contract(EXECUTOR, abi, wallet);
+                const tx = await contract.executeTriangle(config.router, ["0x...", "0x...", "0x..."], amountIn, { value: amountIn, gasLimit: 1000000 });
                 console.log(`🚀 STRIKE SENT: ${tx.hash}`.cyan);
-            } catch (e) {
-                console.log(`[REVERT] Capital Protected.`.gray);
             }
+        } catch (e) {
+            if (!e.message.includes("429")) console.log(`[${networkName}] Error: ${e.message}`.gray);
         }
     }
 
     async run() {
-        console.log("⚡ APEX TITAN v206.0 | MULTICALL-SINGULARITY ACTIVE".gold);
-        // Example Pool List (Replace with actual pool addresses for your strategy)
+        console.log("⚡ APEX TITAN v206.1 | STABILITY CORE ACTIVE".gold);
         const myPools = ["0x...", "0x..."]; 
 
         while (true) {
             for (const net of Object.keys(NETWORKS)) {
                 await this.executeStrike(net, myPools);
             }
-            await new Promise(r => setTimeout(r, 2000));
+            // Increased sleep to 4s to satisfy Infura free tier limits
+            await new Promise(r => setTimeout(r, 4000));
         }
     }
 }
 
-// Ignition
 const governor = new ApexOmniGovernor();
 governor.run();
