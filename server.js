@@ -1,6 +1,6 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v206.6 (FIXED - ARGUMENT VALIDATION)
+ * APEX PREDATOR v206.7 (FIXED - CHAIN-SPECIFIC ROUTING)
  * ===============================================================================
  */
 
@@ -11,17 +11,19 @@ const colors = require('colors');
 
 colors.enable();
 
-// --- CONFIGURATION ---
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const EXECUTOR = process.env.EXECUTOR_ADDRESS;
 
-// !!! REPLACE THESE WITH ACTUAL POOL ADDRESSES !!!
-// Use checksummed addresses from Etherscan/Basescan
-const TARGET_POOLS = [
-    "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // Example Checksummed Address
-    "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D", 
-    "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"
-];
+// --- CRITICAL: SEPARATE POOLS BY CHAIN ---
+const POOL_MAP = {
+    ETHEREUM: [
+        "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640", // ETH/USDC Uniswap V3 (Example)
+        "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD"  // WBTC/ETH
+    ],
+    BASE: [
+        "0xd0b53D9277af2a1239b70BD72B516d3C45527310", // WETH/USDC (Example)
+        "0x4C36388bE6F6521943841B2583d91971438b8289"  // cbETH/WETH
+    ]
+};
 
 const NETWORKS = {
     ETHEREUM: { 
@@ -56,63 +58,52 @@ class ApexOmniGovernor {
         }
     }
 
-    async shield() {
-        const now = Date.now();
-        if (now - this.lastCall < 500) await new Promise(r => setTimeout(r, 500));
-        this.lastCall = Date.now();
-    }
-
-    async scan(networkName, poolAddresses) {
-        // Validation: Ensure addresses are valid before calling
-        const validPools = poolAddresses.filter(addr => {
-            if (!isAddress(addr)) {
-                console.log(colors.red(`[ERROR] Invalid Address skipped: ${addr}`));
-                return false;
-            }
-            return true;
-        });
-
-        if (validPools.length === 0) return;
-
+    async scan(networkName) {
         const config = NETWORKS[networkName];
+        const poolAddresses = POOL_MAP[networkName] || [];
+
+        // Skip if no pools defined for this chain
+        if (poolAddresses.length === 0) return;
+
         try {
-            await this.shield();
             const multi = new ethers.Contract(config.multicall, this.multiAbi, this.providers[networkName]);
             const itf = new ethers.Interface(this.pairAbi);
             
-            // Format calls correctly for the Multicall tuple
-            const calls = validPools.map(addr => ({
-                target: getAddress(addr), // Enforce Checksum
+            const calls = poolAddresses.filter(isAddress).map(addr => ({
+                target: getAddress(addr),
                 callData: itf.encodeFunctionData("getReserves")
             }));
 
-            const [balance, [, returnData]] = await Promise.all([
-                this.providers[networkName].getBalance(this.wallets[networkName].address),
-                multi.aggregate(calls)
-            ]);
+            // Added Timeout to prevent SERVER_ERROR hanging
+            const multicallPromise = multi.aggregate(calls);
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000));
 
-            // Logic for profit processing here...
-            console.log(colors.gray(`[${networkName}] Scan Complete. Balance: ${ethers.formatEther(balance)} ETH`));
+            const [, returnData] = await Promise.race([multicallPromise, timeoutPromise]);
+
+            console.log(colors.cyan(`[${networkName}] Successful Scan: ${returnData.length} pools.`));
 
         } catch (e) {
-            console.log(colors.yellow(`[${networkName}] Idle: ${e.code || e.message.slice(0, 50)}`));
+            // Detailed Logging for Debugging
+            if (e.code === 'CALL_EXCEPTION') {
+                console.log(colors.yellow(`[${networkName}] Error: Check if pools exist on this chain.`));
+            } else {
+                console.log(colors.gray(`[${networkName}] Connection: ${e.code || "Busy"}`));
+            }
         }
     }
 
     async run() {
         console.log(colors.bold(colors.yellow("\n╔════════════════════════════════════════════════════════╗")));
-        console.log(colors.bold(colors.yellow("║    ⚡ APEX TITAN v206.6 | ARGUMENT SHIELD ACTIVE      ║")));
+        console.log(colors.bold(colors.yellow("║    ⚡ APEX TITAN v206.7 | MULTI-CHAIN ROUTER ACTIVE   ║")));
         console.log(colors.bold(colors.yellow("╚════════════════════════════════════════════════════════╝\n")));
 
         while (true) {
-            for (const name of Object.keys(NETWORKS)) {
-                await this.scan(name, TARGET_POOLS);
-            }
-            await new Promise(r => setTimeout(r, 4000));
+            const tasks = Object.keys(NETWORKS).map(name => this.scan(name));
+            await Promise.allSettled(tasks);
+            await new Promise(r => setTimeout(r, 5000));
         }
     }
 }
 
-// Ignition
 const governor = new ApexOmniGovernor();
 governor.run();
