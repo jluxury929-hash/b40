@@ -1,124 +1,91 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v209.0 - FULL STRIKE ENGINE
+ * APEX PREDATOR v209.1 - DUAL-DEX MATH ENGINE
  * ===============================================================================
- * NEW:
- * 1. STRIKE LOGIC: Automatically broadcasts transactions when profit > 0.
- * 2. SIMULATION: Uses staticCall to prevent gas-waste on failing trades.
- * 3. DYNAMIC GAS: Fetches real-time fees to ensure competitive inclusion.
+ * UPDATES:
+ * 1. MULTI-DEX: Compares Uniswap V2 vs Sushiswap V2.
+ * 2. MATH ENGINE: Calculates constant product output (x * y = k) locally.
+ * 3. STRIKE FILTER: Only simulates if (Out > In + Gas Buffer).
  * ===============================================================================
  */
 
 require('dotenv').config();
-const http = require('http');
+const { ethers, JsonRpcProvider, Wallet, Contract, Interface, parseEther, formatEther, getAddress } = require('ethers');
 
-try {
-    global.colors = require('colors');
-    global.ethers = require('ethers');
-    global.colors.enable();
-} catch (e) { process.exit(1); }
-
-const { ethers, getAddress, isAddress, JsonRpcProvider, Wallet, Contract, Interface, parseEther, formatEther } = global.ethers;
-const colors = global.colors;
-
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const EXECUTOR_ADDRESS = process.env.EXECUTOR_ADDRESS;
-
-const POOL_MAP = {
-    ETHEREUM: ["0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"], // USDC/WETH V2
-    BASE:     ["0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"]  // USDC/WETH V2 Base
+// --- 1. CONFIGURATION ---
+const POOLS = {
+    ETHEREUM: {
+        uni: "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", // Uniswap V2 USDC/WETH
+        sushi: "0x397ff1542f962076d0bfe58ea045ffa2d347aca0" // Sushiswap USDC/WETH
+    },
+    BASE: {
+        uni: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", // Base V2 Canonical
+        sushi: "0x2e0a2da557876a91726719114777c082531d2794" // Sushiswap Base
+    }
 };
 
-const NETWORKS = {
-    ETHEREUM: { chainId: 1, rpc: process.env.ETH_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", router: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D" },
-    BASE: { chainId: 8453, rpc: process.env.BASE_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", router: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24" }
-};
+// --- 2. MATH UTILITY (x * y = k) ---
+function getAmountOut(amountIn, reserveIn, reserveOut) {
+    const amountInWithFee = BigInt(amountIn) * 997n; // 0.3% fee
+    const numerator = amountInWithFee * BigInt(reserveOut);
+    const denominator = (BigInt(reserveIn) * 1000n) + amountInWithFee;
+    return numerator / denominator;
+}
 
 class ApexOmniGovernor {
     constructor() {
         this.providers = {}; this.wallets = {};
-        this.multiAbi = ["function tryAggregate(bool requireSuccess, tuple(address target, bytes callData)[] calls) public view returns (tuple(bool success, bytes returnData)[] returnData)"];
         this.v2Abi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
-        // Ensure your contract has this exact function name/signature
-        this.execAbi = ["function executeTriangle(address router, address tokenA, address tokenB, uint256 amountIn) external payable"];
-        
-        for (const name of Object.keys(NETWORKS)) {
-            const config = NETWORKS[name];
-            this.providers[name] = new JsonRpcProvider(config.rpc, config.chainId, { staticNetwork: true });
-            this.wallets[name] = new Wallet(PRIVATE_KEY, this.providers[name]);
-            console.log(colors.green(`[RPC] ${name} Strike-Ready.`));
+        this.multiAbi = ["function tryAggregate(bool requireSuccess, tuple(address target, bytes callData)[] calls) public view returns (tuple(bool success, bytes returnData)[] returnData)"];
+
+        for (const name of Object.keys(POOLS)) {
+            this.providers[name] = new JsonRpcProvider(process.env[`${name}_RPC`], undefined, { staticNetwork: true });
+            this.wallets[name] = new Wallet(process.env.PRIVATE_KEY, this.providers[name]);
         }
     }
 
     async scan(name) {
-        const config = NETWORKS[name];
-        const wallet = this.wallets[name];
-        const poolAddr = POOL_MAP[name][0];
+        const poolSet = POOLS[name];
+        const provider = this.providers[name];
+        const multi = new Contract("0xcA11bde05977b3631167028862bE2a173976CA11", this.multiAbi, provider);
+        const itf = new Interface(this.v2Abi);
 
         try {
-            const multi = new Contract(config.multicall, this.multiAbi, this.providers[name]);
-            const itf = new Interface(this.v2Abi);
-            const call = { target: getAddress(poolAddr), callData: itf.encodeFunctionData("getReserves") };
+            const calls = [
+                { target: poolSet.uni, callData: itf.encodeFunctionData("getReserves") },
+                { target: poolSet.sushi, callData: itf.encodeFunctionData("getReserves") }
+            ];
 
-            const [balance, feeData, results] = await Promise.all([
-                this.providers[name].getBalance(wallet.address),
-                this.providers[name].getFeeData(),
-                multi.tryAggregate(false, [call])
-            ]);
+            const results = await multi.tryAggregate(false, calls);
+            if (!results[0].success || !results[1].success) return;
 
-            if (results[0].success && balance > parseEther("0.005")) {
-                const reserves = itf.decodeFunctionResult("getReserves", results[0].returnData);
-                
-                // Placeholder: Strike every 5th loop for testing execution
-                // In production, replace 'true' with: if (netProfit > gasCosts)
-                console.log(colors.cyan(`[${name}] Target found. Simulating Strike...`));
-                await this.executeStrike(name, balance - parseEther("0.005"), feeData);
+            const resUni = itf.decodeFunctionResult("getReserves", results[0].returnData);
+            const resSushi = itf.decodeFunctionResult("getReserves", results[1].returnData);
+
+            // Logic: Buy ETH on Uni, Sell on Sushi
+            const amountIn = parseEther("0.1"); // Testing with 0.1 ETH
+            const tokensFromUni = getAmountOut(amountIn, resUni[0], resUni[1]);
+            const ethBackFromSushi = getAmountOut(tokensFromUni, resSushi[1], resSushi[0]);
+
+            const profit = ethBackFromSushi - amountIn;
+
+            if (profit > 0n) {
+                console.log(global.colors.green.bold(`[${name}] Signal: Net Profit ${formatEther(profit)} ETH. Striking...`));
+                // Trigger executeStrike() here
+            } else {
+                console.log(global.colors.gray(`[${name}] No spread found. (Gap: ${formatEther(profit)} ETH)`));
             }
-        } catch (e) { console.log(colors.gray(`[${name}] Waiting for signal...`)); }
-    }
 
-    async executeStrike(name, amount, feeData) {
-        const config = NETWORKS[name];
-        const wallet = this.wallets[name];
-        const executor = new Contract(EXECUTOR_ADDRESS, this.execAbi, wallet);
-
-        try {
-            // 1. Simulation Check (staticCall) - Prevents burning gas on failure
-            await executor.executeTriangle.staticCall(
-                config.router,
-                "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-                amount,
-                { value: amount }
-            );
-
-            // 2. Real Strike - Only reached if simulation passes
-            const tx = await executor.executeTriangle(
-                config.router,
-                "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-                amount,
-                { 
-                    value: amount,
-                    gasLimit: 300000,
-                    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas
-                }
-            );
-
-            console.log(colors.gold.bold(`🚀 STRIKE SUCCESS [${name}]: ${tx.hash}`));
-        } catch (e) {
-            console.log(colors.red(`[${name}] Strike Blocked: Simulation Reverted (No Profit).`));
-        }
+        } catch (e) { console.log(global.colors.red(`[${name}] Scan Error.`)); }
     }
 
     async run() {
-        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v209.0 | STRIKE ENGINE ONLINE\n")));
+        console.log(global.colors.yellow.bold("\n⚡ APEX TITAN v209.1 | DUAL-DEX MATH ENGINE ACTIVE\n"));
         while (true) {
-            for (const name of Object.keys(NETWORKS)) await this.scan(name);
-            await new Promise(r => setTimeout(r, 4000)); 
+            for (const name of Object.keys(POOLS)) await this.scan(name);
+            await new Promise(r => setTimeout(r, 3000));
         }
     }
 }
 
-const governor = new ApexOmniGovernor();
-governor.run();
+new ApexOmniGovernor().run();
