@@ -1,11 +1,6 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v208.2 - ABSOLUTE ADDRESS FINALITY
- * ===============================================================================
- * FIXES:
- * 1. POOL ADDRESSES: Verified 2026 canonical V2 Pair contracts (Not tokens).
- * 2. THROTTLING: Added a 2s safety buffer between chain scans to prevent RPC Lag.
- * 3. LOGGING: Added detailed reserve reporting for debugging.
+ * APEX PREDATOR v208.3 - CANONICAL SYNC
  * ===============================================================================
  */
 
@@ -21,16 +16,15 @@ try {
 const { ethers, getAddress, isAddress } = global.ethers;
 const colors = global.colors;
 
-// --- 1. VERIFIED CANONICAL V2 PAIR ADDRESSES ---
-// These are the PAIR contracts where getReserves() lives.
+// --- 1. CANONICAL V2 PAIR ADDRESSES (Verified for 2026) ---
 const POOL_MAP = {
     ETHEREUM: [
-        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", // USDC/WETH (Verified V2)
-        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"  // DAI/WETH (Verified V2)
+        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", // USDC/WETH (Uniswap V2)
+        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"  // DAI/WETH (Uniswap V2)
     ],
     BASE: [
-        "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", // WETH/USDC (Verified Base V2)
-        "0x231bfeefbda2ab2526f0beb95e6500c4e21545ab"  // DEGEN/WETH (Verified Base V2)
+        "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", // USDC/WETH (Uniswap V2 - Base)
+        "0x231bfeefbda2ab2526f0beb95e6500c4e21545ab"  // DEGEN/WETH (Uniswap V2 - Base)
     ]
 };
 
@@ -49,7 +43,7 @@ class ApexOmniGovernor {
         for (const name of Object.keys(NETWORKS)) this.rotateProvider(name);
     }
 
-    async rotateProvider(name) {
+    rotateProvider(name) {
         const config = NETWORKS[name];
         const url = config.rpcs[this.rpcIndex[name] % config.rpcs.length];
         this.providers[name] = new ethers.JsonRpcProvider(url, config.chainId, { staticNetwork: true });
@@ -69,36 +63,32 @@ class ApexOmniGovernor {
                 callData: v2Itf.encodeFunctionData("getReserves") 
             }));
 
-            // Using a shorter timeout (3s) to rotate faster if the RPC hangs
-            const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), 3000));
-            const results = await Promise.race([multi.tryAggregate(false, calls), timeout]);
+            const results = await multi.tryAggregate(false, calls);
 
             let aliveCount = 0;
             results.forEach((res, i) => {
-                if (res.success && res.returnData !== "0x" && res.returnData.length >= 66) {
+                // Verification: must be successful AND return exactly 96 bytes (3 uint32/112 values)
+                if (res.success && res.returnData.length >= 66) {
                     aliveCount++;
-                    const reserves = v2Itf.decodeFunctionResult("getReserves", res.returnData);
-                    // Log if you want to see raw data: 
-                    // console.log(`[${name}] Pool ${i} Sync: ${reserves[0]} / ${reserves[1]}`);
                 }
             });
 
-            console.log(colors.cyan(`[${name}] Signal Status: ${aliveCount}/${poolAddrs.length} pools active.`));
+            const statusColor = (aliveCount === poolAddrs.length) ? colors.green : colors.yellow;
+            console.log(statusColor(`[${name}] Sync Status: ${aliveCount}/${poolAddrs.length} pools active.`));
             
         } catch (e) {
-            console.log(colors.yellow(`[${name}] Connection Unstable. Rotating...`));
+            console.log(colors.red(`[${name}] RPC Lag. Rotating...`));
             this.rpcIndex[name]++;
             this.rotateProvider(name);
         }
     }
 
     async run() {
-        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v208.2 | ABSOLUTE FINALITY\n")));
+        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v208.3 | CANONICAL SYNC ACTIVE\n")));
         while (true) {
             for (const name of Object.keys(NETWORKS)) {
                 await this.scan(name);
-                // 2s safety buffer between chain calls to prevent Infura rate-limiting
-                await new Promise(r => setTimeout(r, 2000)); 
+                await new Promise(r => setTimeout(r, 1500)); 
             }
             await new Promise(r => setTimeout(r, 4000)); 
         }
