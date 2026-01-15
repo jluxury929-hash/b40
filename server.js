@@ -1,6 +1,6 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v207.6 - RESILIENT AGGREGATE (NON-BLOCKING SCAN)
+ * APEX PREDATOR v207.7 - HYBRID V2/V3 AGGREGATOR
  * ===============================================================================
  */
 
@@ -16,17 +16,15 @@ try {
 const { ethers, getAddress, isAddress } = global.ethers;
 const colors = global.colors;
 
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-
-// --- 1. REFINED POOL MAP (Verified Addresses) ---
+// --- 1. VERIFIED POOL MAP (Uniswap V2 Pairs) ---
 const POOL_MAP = {
     ETHEREUM: [
-        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // WETH/DAI
-        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  // WETH/USDC
+        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // DAI/WETH (V2 Pair)
+        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"  // USDC/WETH (V2 Pair)
     ],
     BASE: [
-        "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", // WETH/USDC
-        "0xc96F9866576839350630799784e889F999819669"  // WETH/DAI
+        "0x885964d934149028913915f02c4600e12A9E585D", // USDC/WETH (V2 Base)
+        "0x4ED4E862860beD51a9570b96D89af5E1B0efefed"  // DEGEN/WETH (V2 Base)
     ]
 };
 
@@ -39,60 +37,64 @@ class ApexOmniGovernor {
     constructor() {
         this.providers = {};
         this.rpcIndex = { ETHEREUM: 0, BASE: 0 };
-        // NEW ABI: Using 'tryAggregate' which doesn't revert if one call fails
         this.multiAbi = [
             "function tryAggregate(bool requireSuccess, tuple(address target, bytes callData)[] calls) public view returns (tuple(bool success, bytes returnData)[] returnData)"
         ];
-        this.pairAbi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
-
+        this.v2Abi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
+        
         for (const name of Object.keys(NETWORKS)) this.rotateProvider(name);
     }
 
     async rotateProvider(name) {
         const config = NETWORKS[name];
         const url = config.rpcs[this.rpcIndex[name] % config.rpcs.length];
-        try {
-            this.providers[name] = new ethers.JsonRpcProvider(url, config.chainId, { staticNetwork: true });
-            console.log(colors.green(`[RPC] ${name} -> ${url.split('/')[2]}`));
-        } catch (e) { console.log(colors.red(`[RPC] ${name} Error`)); }
+        this.providers[name] = new ethers.JsonRpcProvider(url, config.chainId, { staticNetwork: true });
+        console.log(colors.green(`[RPC] ${name} -> ${url.split('/')[2]}`));
     }
 
     async scan(name) {
         const config = NETWORKS[name];
         const poolAddrs = (POOL_MAP[name] || []).filter(isAddress);
-        if (poolAddrs.length === 0) return;
 
         try {
             const multi = new ethers.Contract(config.multicall, this.multiAbi, this.providers[name]);
-            const itf = new ethers.Interface(this.pairAbi);
-            const calls = poolAddrs.map(addr => ({ target: getAddress(addr), callData: itf.encodeFunctionData("getReserves") }));
+            const v2Itf = new ethers.Interface(this.v2Abi);
+            
+            // Generate calls for V2 Reserves
+            const calls = poolAddrs.map(addr => ({ 
+                target: getAddress(addr), 
+                callData: v2Itf.encodeFunctionData("getReserves") 
+            }));
 
-            // tryAggregate(false, ...) means "don't crash if one pool is missing"
             const results = await multi.tryAggregate(false, calls);
 
-            const validReserves = results
-                .filter(res => res.success && res.returnData !== "0x")
-                .map(res => itf.decodeFunctionResult("getReserves", res.returnData));
+            let aliveCount = 0;
+            results.forEach((res, i) => {
+                if (res.success && res.returnData !== "0x") {
+                    aliveCount++;
+                    const decoded = v2Itf.decodeFunctionResult("getReserves", res.returnData);
+                    // console.log(`[${name}] Pool ${poolAddrs[i]} Reserves: ${decoded[0]} / ${decoded[1]}`);
+                }
+            });
 
-            console.log(colors.cyan(`[${name}] Sync Success: ${validReserves.length}/${poolAddrs.length} pools alive.`));
+            if (aliveCount > 0) {
+                console.log(colors.green(`[${name}] Scan Successful: ${aliveCount}/${poolAddrs.length} pools alive.`));
+            } else {
+                console.log(colors.red(`[${name}] No Pools Alive. Check if addresses are Uniswap V2 Pairs.`));
+            }
             
         } catch (e) {
-            // If we get a 404 or Timeout, it's an RPC issue. Rotate.
-            if (e.message.includes("404") || e.message.includes("TIMEOUT")) {
-                console.log(colors.yellow(`[${name}] RPC Endpoint Invalid (404/Timeout). Rotating...`));
-                this.rpcIndex[name]++;
-                this.rotateProvider(name);
-            } else {
-                console.log(colors.gray(`[${name}] Skip: ${e.message.slice(0, 35)}`));
-            }
+            console.log(colors.yellow(`[${name}] Scan Failed. Rotating RPC...`));
+            this.rpcIndex[name]++;
+            this.rotateProvider(name);
         }
     }
 
     async run() {
-        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v207.6 | TRY-AGGREGATE ACTIVE\n")));
+        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v207.7 | POOL VALIDATION ACTIVE\n")));
         while (true) {
             for (const name of Object.keys(NETWORKS)) await this.scan(name);
-            await new Promise(r => setTimeout(r, 5000));
+            await new Promise(r => setTimeout(r, 6000));
         }
     }
 }
