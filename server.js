@@ -1,6 +1,6 @@
 /**
  * ===============================================================================
- * APEX PREDATOR v207.7 - HYBRID V2/V3 AGGREGATOR
+ * APEX PREDATOR v207.8 - OMNI-CHAIN PAIR SYNC
  * ===============================================================================
  */
 
@@ -16,15 +16,15 @@ try {
 const { ethers, getAddress, isAddress } = global.ethers;
 const colors = global.colors;
 
-// --- 1. VERIFIED POOL MAP (Uniswap V2 Pairs) ---
+// --- 1. VERIFIED POOL MAP (Uniswap V2 Pair Contracts Only) ---
 const POOL_MAP = {
     ETHEREUM: [
-        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // DAI/WETH (V2 Pair)
-        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"  // USDC/WETH (V2 Pair)
+        "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // DAI/WETH
+        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"  // USDC/WETH
     ],
     BASE: [
-        "0x885964d934149028913915f02c4600e12A9E585D", // USDC/WETH (V2 Base)
-        "0x4ED4E862860beD51a9570b96D89af5E1B0efefed"  // DEGEN/WETH (V2 Base)
+        "0x885964d934149028913915f02c4600e12A9E585D", // USDC/WETH (Base V2 Pair)
+        "0x4ED4E862860beD51a9570b96D89af5E1B0efefed"  // DEGEN/WETH (Base V2 Pair)
     ]
 };
 
@@ -60,41 +60,40 @@ class ApexOmniGovernor {
             const multi = new ethers.Contract(config.multicall, this.multiAbi, this.providers[name]);
             const v2Itf = new ethers.Interface(this.v2Abi);
             
-            // Generate calls for V2 Reserves
             const calls = poolAddrs.map(addr => ({ 
                 target: getAddress(addr), 
                 callData: v2Itf.encodeFunctionData("getReserves") 
             }));
 
+            // tryAggregate(false) prevents whole-call failure if one pair is paused/dead
             const results = await multi.tryAggregate(false, calls);
 
             let aliveCount = 0;
             results.forEach((res, i) => {
                 if (res.success && res.returnData !== "0x") {
                     aliveCount++;
-                    const decoded = v2Itf.decodeFunctionResult("getReserves", res.returnData);
-                    // console.log(`[${name}] Pool ${poolAddrs[i]} Reserves: ${decoded[0]} / ${decoded[1]}`);
+                    // Verification success
                 }
             });
 
             if (aliveCount > 0) {
-                console.log(colors.green(`[${name}] Scan Successful: ${aliveCount}/${poolAddrs.length} pools alive.`));
+                console.log(colors.green(`[${name}] Sync Successful: ${aliveCount}/${poolAddrs.length} pools alive.`));
             } else {
-                console.log(colors.red(`[${name}] No Pools Alive. Check if addresses are Uniswap V2 Pairs.`));
+                console.log(colors.red(`[${name}] CRITICAL: No V2 Pairs detected. Verify addresses.`));
             }
             
         } catch (e) {
-            console.log(colors.yellow(`[${name}] Scan Failed. Rotating RPC...`));
+            console.log(colors.yellow(`[${name}] RPC Lag Detected. Rotating...`));
             this.rpcIndex[name]++;
             this.rotateProvider(name);
         }
     }
 
     async run() {
-        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v207.7 | POOL VALIDATION ACTIVE\n")));
+        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v207.8 | OMNI-CHAIN SYNC ACTIVE\n")));
         while (true) {
             for (const name of Object.keys(NETWORKS)) await this.scan(name);
-            await new Promise(r => setTimeout(r, 6000));
+            await new Promise(r => setTimeout(r, 5000));
         }
     }
 }
